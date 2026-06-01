@@ -1,0 +1,120 @@
+name: Update Sentry CLI version
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Every Monday at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - uses: cachix/install-nix-action@v30
+
+      - name: Capture old version
+        run: |
+          version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' versions.nix | head -1)
+          echo "OLD_VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Update version
+        run: |
+          nix run .#update
+          new_version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' versions.nix | head -1)
+          echo "NEW_VERSION=${new_version}" >> "$GITHUB_ENV"
+
+      - name: Generate job summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          old_version="$OLD_VERSION"
+          new_version=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' versions.nix | head -1)
+
+          {
+            echo "## Sentry CLI Version Update"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$old_version" == "$new_version" ]]; then
+            echo "No update. Current version: \`$new_version\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "| | Version |"
+              echo "| --- | --- |"
+              echo "| **Old** | \`$old_version\` |"
+              echo "| **New** | \`$new_version\` |"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # Try to fetch release notes from getsentry/cli
+            release_json=$(gh api "repos/getsentry/cli/releases/tags/${new_version}" 2>/dev/null || true)
+            if [[ -n "$release_json" ]] && echo "$release_json" | jq -e '.tag_name' > /dev/null 2>&1; then
+              release_url=$(echo "$release_json" | jq -r '.html_url // ""')
+              release_body=$(echo "$release_json" | jq -r '.body // ""')
+
+              {
+                echo "#### Release Notes"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              if [[ -n "$release_url" ]]; then
+                echo "[View on GitHub]($release_url)" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+              fi
+
+              if [[ -n "$release_body" ]]; then
+                echo "$release_body" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+
+            # Commit diff between old and new
+            compare_json=$(gh api "repos/getsentry/cli/compare/${old_version}...${new_version}" 2>/dev/null || true)
+            if [[ -n "$compare_json" ]] && echo "$compare_json" | jq -e '.commits' > /dev/null 2>&1; then
+              compare_url=$(echo "$compare_json" | jq -r '.permalink_url // .html_url // ""')
+              commits_md=$(echo "$compare_json" | jq -r \
+                '.commits[] | "- [`\(.sha[0:7])`](\(.html_url)) \(.commit.message | split("\n")[0])"' \
+                2>/dev/null || true)
+
+              {
+                echo "#### Commit Diff"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              if [[ -n "$compare_url" ]]; then
+                echo "[View full diff on GitHub]($compare_url)" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+              fi
+
+              if [[ -n "$commits_md" ]]; then
+                echo "$commits_md" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+          fi
+
+      - name: Create PR if changed
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: update Sentry CLI to ${{ env.NEW_VERSION }}"
+          title: "chore: update Sentry CLI to ${{ env.NEW_VERSION }}"
+          body: >
+            Automated weekly update of Sentry CLI version.
+          branch: auto-update-sentry-cli
+          delete-branch: true
+
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-number != ''
+        run: gh pr merge --auto --squash "$PR_NUMBER"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
